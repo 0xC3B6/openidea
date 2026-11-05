@@ -454,6 +454,36 @@ echo "added 1 package""#,
     assert!(env.root.join("package.json").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn npm_install_reports_permission_hint_and_keeps_the_full_log() {
+    let env = Env::new();
+    env.script(
+        &env.sys,
+        "npm",
+        r#"printf '%s\n' \
+  'npm error code EEXIST' \
+  'npm error fetch https://user:synthetic-secret@example.invalid/?token=synthetic-secret failed: EACCES: permission denied, mkdir "/tmp/npm cache"' \
+  'npm error File exists' \
+  'npm error Remove the existing file and try again' \
+  'npm error with --force to overwrite files recklessly' \
+  'npm error A complete log is available' >&2
+exit 1"#,
+    );
+    let lines = std::sync::Mutex::new(Vec::new());
+    let emit = |event: InstallEvent| {
+        if let InstallEvent::Line { text } = event {
+            lines.lock().unwrap().push(text);
+        }
+    };
+    let err = env.tools().install("intelephense", &langs(), &CancellationToken::new(), &emit).unwrap_err();
+    assert!(err.message.contains("EACCES: permission denied"), "{}", err.message);
+    assert!(!err.message.contains("/tmp/npm cache"), "{}", err.message);
+    assert!(!err.message.contains("synthetic-secret"), "{}", err.message);
+    assert!(!err.message.contains("example.invalid"), "{}", err.message);
+    assert!(lines.into_inner().unwrap().iter().any(|line| line.contains("/tmp/npm cache")));
+}
+
 /// Servers that load TypeScript as a library get one with its JS API: `@latest`
 /// is TypeScript 7 (native, no `ts.server`), which crashed vue-language-server (#25).
 /// Uninstalling one keeps the TypeScript another installed server still uses.

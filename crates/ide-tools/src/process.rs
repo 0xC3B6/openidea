@@ -23,6 +23,74 @@ fn describe(cmd: &Command) -> String {
     s
 }
 
+// Only surface known permission markers; the full line may contain credentials.
+fn permission_hint(line: &str) -> Option<String> {
+    let text = line
+        .split_whitespace()
+        .map(|word| {
+            let lower = word.to_ascii_lowercase();
+            let code_assignment = lower
+                .strip_prefix("code=")
+                .or_else(|| lower.strip_prefix("errno="))
+                .is_some_and(|value| matches!(value.trim_matches(|c: char| !c.is_alphanumeric()), "eacces" | "eperm"));
+            let path = word.trim_start_matches(['"', '\'', '(', '[']);
+            let bytes = path.as_bytes();
+            let windows_path = bytes.get(1) == Some(&b':') && matches!(bytes.get(2), Some(b'\\' | b'/'));
+            if word.contains("://")
+                || word.starts_with("//")
+                || (word.contains('@') && word.contains(':'))
+                || (word.contains('=') && !code_assignment)
+                || (word.contains('{') && word.contains('"') && word.contains(':'))
+                || path.starts_with('/')
+                || path.starts_with("./")
+                || path.starts_with("../")
+                || windows_path
+            {
+                "[redacted]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = text.to_ascii_lowercase();
+    let identifier = |c: char| c.is_alphanumeric() || c == '_';
+    let mut matches: Vec<(usize, &str)> = [
+        "eacces",
+        "eperm",
+        "permission denied",
+        "operation not permitted",
+        "access is denied",
+        "access denied",
+        "unauthorizedaccessexception",
+    ]
+    .into_iter()
+    .filter_map(|marker| {
+        lower
+            .match_indices(marker)
+            .find(|&(i, _)| {
+                let len = marker.len();
+                lower[..i].chars().next_back().is_none_or(|c| !identifier(c))
+                    && lower[i + len..].chars().next().is_none_or(|c| !identifier(c))
+            })
+            .map(|(i, _)| (i, &text[i..i + marker.len()]))
+    })
+    .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    matches.sort_by_key(|(i, _)| *i);
+    let hint = matches.into_iter().map(|(_, marker)| marker).collect::<Vec<_>>().join(": ");
+    let warning = text
+        .split_whitespace()
+        .take(3)
+        .find(|word| matches!(word.trim_end_matches(':').to_ascii_lowercase().as_str(), "warn" | "warning"));
+    Some(match warning {
+        Some(warning) => format!("{}: {hint}", warning.trim_end_matches(':')),
+        None => hint,
+    })
+}
+
 /// Runs `cmd`, forwarding each stdout/stderr line as [`InstallEvent::Line`].
 /// Returns the collected output; fails on non-zero exit or cancellation.
 pub fn run_streamed(cmd: Command, cancel: &CancellationToken, emit: Emit) -> IdeResult<String> {
@@ -31,11 +99,18 @@ pub fn run_streamed(cmd: Command, cancel: &CancellationToken, emit: Emit) -> Ide
     if !ok {
         let tail: Vec<&str> = output.lines().rev().filter(|l| !l.trim().is_empty()).take(3).collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
+        let permission = output.lines().rev().find_map(|line| permission_hint(line).map(|hint| (line, hint)));
+        let mut detail = tail.join(" / ");
+        if let Some((line, hint)) = permission
+            && !tail.contains(&line)
+        {
+            detail = format!("{hint} / {detail}");
+        }
         return Err(IdeError::new(
             ErrorKind::Io,
             format!(
                 "`{label}` failed ({status}){}",
-                if tail.is_empty() { String::new() } else { format!(": {}", tail.join(" / ")) }
+                if detail.is_empty() { String::new() } else { format!(": {detail}") }
             ),
         ));
     }
@@ -593,6 +668,153 @@ mod tests {
         assert!(err.message.contains("failed"), "{}", err.message);
         let lines = lines.into_inner().unwrap();
         assert!(lines.contains(&"one".to_string()) && lines.contains(&"two".to_string()), "{lines:?}");
+    }
+
+    #[test]
+    fn permission_hints_ignore_urls_and_unrelated_unicode() {
+        assert!(permission_hint("https://example.invalid/EACCES?token=synthetic-secret").is_none());
+        assert!(permission_hint("token=EPERM").is_none());
+        assert!(permission_hint(r#"{"token":"EACCES"}"#).is_none());
+        let line = format!(
+            "{} EACCES: Permission denied https://user:synthetic-secret@example.invalid/ {}",
+            "🐘".repeat(512),
+            "汉".repeat(512)
+        );
+        let hint = permission_hint(&line).unwrap();
+        assert!(hint.contains("EACCES: Permission denied"), "{hint}");
+        assert!(hint.chars().count() <= 512);
+        assert!(!hint.contains("synthetic-secret"), "{hint}");
+    }
+
+    #[test]
+    fn permission_hints_do_not_match_inside_identifiers() {
+        assert!(permission_hint("npm error package filePermissionHandler not found").is_none());
+        assert!(permission_hint("npm error package eaccessibility not found").is_none());
+        assert!(permission_hint("npm error package 前EPERM后 not found").is_none());
+        assert!(permission_hint("npm error cannot find /tmp/EACCES/config").is_none());
+        assert!(permission_hint(r#"npm error cannot find "C:\tmp\EPERM\config""#).is_none());
+        assert!(permission_hint("npm error code=/tmp/EACCES/config").is_none());
+        assert_eq!(permission_hint("npm error code=EACCES").as_deref(), Some("EACCES"));
+        assert!(permission_hint("npm error [EPERM]: operation not permitted").is_some());
+    }
+
+    #[test]
+    fn permission_hints_do_not_expose_paths_or_credentials() {
+        let npm = "npm error EACCES: permission denied, mkdir '/tmp/npm  cache' Authorization: Bearer synthetic-secret //registry.invalid/:_authToken=synthetic-secret";
+        let hint = permission_hint(npm).unwrap();
+        assert_eq!(hint, "EACCES: permission denied");
+        assert!(!hint.contains("/tmp/npm"), "{hint}");
+        assert!(!hint.contains("synthetic-secret"), "{hint}");
+        assert!(!hint.contains("registry.invalid"), "{hint}");
+
+        for go in [
+            "go: open /tmp/project/file: permission denied",
+            "go: open /tmp/password-cache: permission denied",
+            "go: open /tmp/authorization.php: permission denied",
+        ] {
+            assert_eq!(permission_hint(go).as_deref(), Some("permission denied"));
+        }
+
+        for go in ["go: open password: permission denied", "go: open token: permission denied"] {
+            assert_eq!(permission_hint(go).as_deref(), Some("permission denied"));
+        }
+
+        let npm_with_url = "npm fetch https://user:synthetic-secret@example.invalid/pkg?token=synthetic-secret: EACCES: permission denied, mkdir '/tmp/cache'";
+        let hint = permission_hint(npm_with_url).unwrap();
+        assert!(hint.contains("EACCES: permission denied"), "{hint}");
+        assert!(!hint.contains("/tmp/cache"), "{hint}");
+        assert!(!hint.contains("synthetic-secret"), "{hint}");
+
+        for credential in [
+            "--password synthetic-secret",
+            "--token synthetic-secret",
+            "_authToken = synthetic-secret",
+            "Cookie: session=synthetic-secret",
+            "Authorization: Bearer synthetic-secret",
+            "user:synthetic-secret@registry.invalid",
+            "api_key=synthetic-secret",
+            "AWS_SECRET_ACCESS_KEY=synthetic-secret",
+            r#"{"token":"synthetic-secret"}"#,
+        ] {
+            let hint = permission_hint(&format!("EACCES: permission denied {credential}")).unwrap();
+            assert!(!hint.contains("synthetic-secret"), "{hint}");
+            assert!(!hint.contains("registry.invalid"), "{hint}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installer_failures_show_permission_errors_before_the_final_hints() {
+        for (diagnostic, expected) in [
+            ("npm error EACCES: permission denied, mkdir '/tmp/npm-cache'", "EACCES: permission denied"),
+            ("pip: [Errno 13] Permission denied: '/tmp/package'", "Permission denied"),
+            ("go: open /tmp/module: access is denied", "access is denied"),
+            ("npm ERR! code EPERM", "EPERM"),
+            ("gem: operation not permitted", "operation not permitted"),
+            (
+                "System.UnauthorizedAccessException: Access to the path '/tmp/cache' is denied",
+                "UnauthorizedAccessException",
+            ),
+        ] {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "printf '%s\\n' \"$DIAGNOSTIC\" 'remove the file' 'try again' 'see the log' >&2; exit 1"]);
+            cmd.env("DIAGNOSTIC", diagnostic);
+            let err = run_streamed(cmd, &CancellationToken::new(), &|_| {}).unwrap_err();
+            assert!(err.message.contains(expected), "{}", err.message);
+            assert!(err.message.contains("see the log"), "{}", err.message);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_error_already_in_tail_is_not_repeated() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s\\n' 'first' \"$DIAGNOSTIC\" 'see the log' >&2; exit 1"]);
+        cmd.env("DIAGNOSTIC", "npm error code EACCES");
+        let err = run_streamed(cmd, &CancellationToken::new(), &|_| {}).unwrap_err();
+        assert_eq!(err.message.matches("EACCES").count(), 1, "{}", err.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_hint_does_not_expose_registry_credentials() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s\\n' \"$DIAGNOSTIC\" 'hint one' 'hint two' 'see the log' >&2; exit 1"]);
+        cmd.env(
+            "DIAGNOSTIC",
+            "npm error EACCES: permission denied fetching https://user:synthetic-secret@example.invalid/?token=synthetic-secret",
+        );
+        let err = run_streamed(cmd, &CancellationToken::new(), &|_| {}).unwrap_err();
+        assert!(err.message.contains("EACCES: permission denied"), "{}", err.message);
+        assert!(!err.message.contains("synthetic-secret"), "{}", err.message);
+        assert!(!err.message.contains("example.invalid"), "{}", err.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_permission_errors_keep_the_existing_tail() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s\\n' 'network error' 'hint one' 'hint two' 'see the log' >&2; exit 1"]);
+        let err = run_streamed(cmd, &CancellationToken::new(), &|_| {}).unwrap_err();
+        assert!(err.message.ends_with("hint one / hint two / see the log"), "{}", err.message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_warning_keeps_its_context_when_a_later_failure_is_unrelated() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "printf '%s\\n' \"$WARNING\" 'npm error code ENOTFOUND' 'network unavailable' 'see the log' >&2; exit 1",
+        ]);
+        cmd.env("WARNING", "npm WARN permission denied while reading optional /tmp/cache");
+        let err = run_streamed(cmd, &CancellationToken::new(), &|_| {}).unwrap_err();
+        assert!(err.message.contains("WARN: permission denied"), "{}", err.message);
+        assert!(
+            err.message.ends_with("npm error code ENOTFOUND / network unavailable / see the log"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
