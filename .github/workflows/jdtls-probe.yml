@@ -1,0 +1,54 @@
+# Measurement for #2693 on a fork; not meant for upstream.
+name: jdtls implementation probe
+on:
+  push:
+    branches: [probe/jdtls-implementations]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  JDTLS: 1.63.0-202610191322
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        project:
+          - { name: petclinic, repo: spring-projects/spring-petclinic }
+          - { name: mall, repo: macrozheng/mall }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: java/java-usages }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: JDT LS
+        run: |
+          mkdir -p "$RUNNER_TEMP/jdtls"
+          curl -fsSL "https://download.eclipse.org/jdtls/milestones/${JDTLS%-*}/jdt-language-server-$JDTLS.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/jdtls"
+      - name: Project
+        run: |
+          git clone --depth 1 "https://github.com/${{ matrix.project.repo }}" "$RUNNER_TEMP/project"
+          git -C "$RUNNER_TEMP/project" rev-parse HEAD
+          (cd "$RUNNER_TEMP/project" && mvn -B -q -DskipTests dependency:go-offline) || echo "go-offline failed; jdtls downloads the rest"
+      - name: Probe
+        run: |
+          mkdir -p out
+          python -I java/java-usages/tests/probe_implementations.py "$RUNNER_TEMP/jdtls" "$RUNNER_TEMP/project" \
+            "out/probe-${{ matrix.os }}-${{ matrix.project.name }}.json"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.os }}-${{ matrix.project.name }}
+          path: out/
