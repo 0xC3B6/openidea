@@ -142,7 +142,7 @@ def scan():
         methods = []
         for i, l in enumerate(lines[line + 1:], line + 1):
             mm = METHOD.match(l)
-            if not mm or mm.group(1).split()[0] in KEYWORDS or re.search(r'\b(static|private|final)\b', l[:mm.start(2)]):
+            if not mm or (mm.group(1).split() or [''])[0] in KEYWORDS or re.search(r'\b(static|private|final)\b', l[:mm.start(2)]):
                 continue
             methods.append((i, mm.start(2)))
         found.append((path, text, kind, (line, m.start(3)), methods))

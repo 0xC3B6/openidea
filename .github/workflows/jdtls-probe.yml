@@ -18,7 +18,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         project:
-          - { name: petclinic, repo: spring-projects/spring-petclinic }
           - { name: mall, repo: macrozheng/mall }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
