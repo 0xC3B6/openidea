@@ -297,6 +297,10 @@ finally:
     jdt_log = work / 'metadata' / '.metadata' / '.log'
     if jdt_log.is_file():
         shutil.copy(jdt_log, out.with_suffix('.jdtls.log'))
+    # Equinox start-up failures are logged in the configuration directory.
+    for i, startup in enumerate(sorted(config.glob('*.log'))):
+        shutil.copy(startup, out.with_suffix(f'.startup{i}.log'))
+        print(startup.read_text(errors='replace')[:3000])
     proc.kill()
     log.close()
     shutil.rmtree(work, ignore_errors=True)
