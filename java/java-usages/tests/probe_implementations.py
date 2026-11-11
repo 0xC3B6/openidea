@@ -36,7 +36,7 @@ proc = subprocess.Popen(['java', '-Declipse.application=org.eclipse.jdt.ls.core.
                          '-jar', str(launcher), '-configuration', str(config), '-data', str(work / 'metadata')],
                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
 write_lock, id_lock = threading.Lock(), threading.Lock()
-pending, statuses = {}, []
+pending, statuses, stray = {}, [], []
 seq = 0
 t_start = time.monotonic()
 
@@ -55,10 +55,20 @@ def reader():
             line = proc.stdout.readline()
             if not line:
                 return
-            if line == b'\r\n':
-                break
-            k, v = line.decode().split(':', 1)
-            headers[k.lower()] = v.strip()
+            if line in (b'\r\n', b'\n'):
+                if headers:
+                    break
+                continue
+            text = line.decode(errors='replace')
+            if ':' not in text:
+                stray.append(text.rstrip()[:200])
+                continue
+            k, v = text.split(':', 1)
+            # Stray output without a newline can prefix a header.
+            k = 'content-length' if k.lower().endswith('content-length') else k.strip().lower()
+            headers[k] = v.strip()
+        if 'content-length' not in headers:
+            continue
         msg = json.loads(proc.stdout.read(int(headers['content-length'])))
         if 'method' in msg and 'id' in msg:
             items = (msg.get('params') or {}).get('items') or []
@@ -73,7 +83,14 @@ def reader():
             statuses.append((time.monotonic() - t_start, msg['params']))
 
 
-threading.Thread(target=reader, daemon=True).start()
+def guarded_reader():
+    try:
+        reader()
+    except Exception as e:
+        stray.append(f'reader died: {e!r}')
+
+
+threading.Thread(target=guarded_reader, daemon=True).start()
 
 
 def timed(method, params, timeout=300):
@@ -266,6 +283,7 @@ except Exception as e:
     report['error'] = repr(e)
     raise
 finally:
+    report['stray_stdout'] = stray[:20]
     report['statuses'] = [(round(t, 1), p.get('type'), p.get('message')) for t, p in statuses][-40:]
     out.write_text(json.dumps(report, indent=1, default=str))
     keys = ['os', 'cpus', 'project', 'projects', 'jars', 'source_files', 'import_s', 'build_ms', 'error']

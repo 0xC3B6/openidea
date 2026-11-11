@@ -34,18 +34,19 @@ jobs:
         with: { python-version: "3.12" }
       - name: JDT LS
         run: |
-          mkdir -p "$RUNNER_TEMP/jdtls"
-          curl -fsSL "https://download.eclipse.org/jdtls/milestones/${JDTLS%-*}/jdt-language-server-$JDTLS.tar.gz" \
-            | tar xz -C "$RUNNER_TEMP/jdtls"
+          # Relative paths: Windows tar cannot open D:\ paths.
+          mkdir -p ../jdtls
+          curl -fsSL -o ../jdtls.tar.gz "https://download.eclipse.org/jdtls/milestones/${JDTLS%-*}/jdt-language-server-$JDTLS.tar.gz"
+          tar xzf ../jdtls.tar.gz -C ../jdtls
       - name: Project
         run: |
-          git clone --depth 1 "https://github.com/${{ matrix.project.repo }}" "$RUNNER_TEMP/project"
-          git -C "$RUNNER_TEMP/project" rev-parse HEAD
-          (cd "$RUNNER_TEMP/project" && mvn -B -q -DskipTests dependency:go-offline) || echo "go-offline failed; jdtls downloads the rest"
+          git clone --depth 1 "https://github.com/${{ matrix.project.repo }}" ../project
+          git -C ../project rev-parse HEAD
+          (cd ../project && mvn -B -q -DskipTests dependency:go-offline) || echo "go-offline failed; jdtls downloads the rest"
       - name: Probe
         run: |
           mkdir -p out
-          python -I java/java-usages/tests/probe_implementations.py "$RUNNER_TEMP/jdtls" "$RUNNER_TEMP/project" \
+          python -I java/java-usages/tests/probe_implementations.py ../jdtls ../project \
             "out/probe-${{ matrix.os }}-${{ matrix.project.name }}.json"
       - if: always()
         uses: actions/upload-artifact@v4
