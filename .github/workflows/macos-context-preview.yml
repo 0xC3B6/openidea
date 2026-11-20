@@ -40,7 +40,10 @@ jobs:
           app="target/aarch64-apple-darwin/release/bundle/macos/OpenIDEA Context Preview.app"
           test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "ai.l0ng.openidea.context-preview"
           binary="$(plutil -extract CFBundleExecutable raw "$app/Contents/Info.plist")"
-          lipo -verify_arch arm64 "$app/Contents/MacOS/$binary"
+          lipo "$app/Contents/MacOS/$binary" -verify_arch arm64
+          if ! codesign --verify --deep --strict "$app"; then
+            codesign --force --deep --sign - --entitlements src-tauri/Entitlements.plist "$app"
+          fi
           codesign --verify --deep --strict "$app"
           mkdir -p package
           ditto -c -k --sequesterRsrc --keepParent "$app" package/OpenIDEA-Context-Preview-arm64.zip
